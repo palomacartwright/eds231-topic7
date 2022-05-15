@@ -1,0 +1,195 @@
+---
+title: "Homework 6: Word Embeddings"
+author: "Paloma Cartwright"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(here)
+library(tidytext)
+library(tidyverse)
+library(widyr)
+library(irlba) #singluar value decomposition
+library(broom) # creating search_synonym function
+library(textdata)
+library(ggplot2)
+library(dplyr)
+library(data.table)
+library(patchwork)
+```
+
+## Classwork Data Set-up
+
+```{r data}
+incidents_df <- read_csv("https://raw.githubusercontent.com/MaRo406/EDS_231-text-sentiment/825b159b6da4c7040ce8295b9eae2fbbe9991ffd/dat/climbing_report_text.csv")
+```
+
+Next, we need to know how often we find each word near each other word -- the skipgram probabilities. This is where we use the sliding window.
+
+```{r}
+skipgrams <- incidents_df %>%
+    unnest_tokens(ngram, Text, token = "ngrams", n = 5) %>%
+    mutate(ngramID = row_number()) %>% 
+    tidyr::unite(skipgramID, ID, ngramID) %>%
+    unnest_tokens(word, ngram) %>%
+    anti_join(stop_words, by = 'word')
+
+unigram_probs <- incidents_df %>%
+    unnest_tokens(word, Text) %>%
+    anti_join(stop_words, by = 'word') %>%
+    count(word, sort = TRUE) %>%
+    mutate(p = n / sum(n)) 
+unigram_probs 
+
+
+#calculate probabilities
+skipgram_probs <- skipgrams %>%
+    pairwise_count(word, skipgramID, diag = TRUE, sort = TRUE) %>%
+    mutate(p = n / sum(n))
+
+#normalize probabilities
+normalized_prob <- skipgram_probs %>%
+    filter(n > 20) %>%
+    rename(word1 = item1, word2 = item2) %>%
+    left_join(unigram_probs %>%
+                  select(word1 = word, p1 = p),
+              by = "word1") %>%
+    left_join(unigram_probs %>%
+                  select(word2 = word, p2 = p),
+              by = "word2") %>%
+    mutate(p_together = p / p1 / p2)
+
+```
+
+```{r pmi}
+pmi_matrix <- normalized_prob %>%
+    mutate(pmi = log10(p_together)) %>%
+    cast_sparse(word1, word2, pmi)
+ 
+#remove missing data
+pmi_matrix@x[is.na(pmi_matrix@x)] <- 0
+#run SVD using irlba() which is good for sparse matrices
+pmi_svd <- irlba(pmi_matrix, 100, maxit = 500) #Reducing to 100 dimensions
+#next we output the word vectors:
+word_vectors <- pmi_svd$u
+rownames(word_vectors) <- rownames(pmi_matrix)
+```
+
+### Synonym Function 
+
+```{r syn-function}
+search_synonyms <- function(word_vectors, selected_vector) {
+  dat <- word_vectors %*% selected_vector
+  
+  similarities <- dat %>%
+    tibble(token = rownames(dat), similarity = dat[,1])
+  
+  similarities %>%
+    arrange(-similarity) %>%
+    select(c(2,3))
+}
+```
+
+### Find the synonyms in the climbing data 
+
+```{r}
+fall_climb  <- search_synonyms(word_vectors,word_vectors["fall",])
+slip_climb <- search_synonyms(word_vectors,word_vectors["slip",])
+```
+
+### Plot the synonyms in the climbing data 
+
+```{r}
+climb_syn_plot <- slip_climb %>%
+  mutate(selected = "slip") %>%
+  bind_rows(fall_climb %>%
+              mutate(selected = "fall")) %>%
+  group_by(selected) %>%
+  top_n(15, similarity) %>%
+  ungroup %>%
+  mutate(token = reorder(token, 
+                         similarity)) %>%
+  ggplot(aes(token, similarity, fill = selected)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~selected, scales = "free") +
+  coord_flip() +
+  theme(strip.text = element_text(hjust=0, size=12)) +
+  scale_y_continuous(expand = c(0,0)) +
+  labs(x = NULL, 
+       title = "What word vectors are most similar to slip or fall in climbing data?")
+
+climb_syn_plot
+```
+
+### Word Math on the climbing data 
+
+```{r}
+snow_danger <- word_vectors["snow",] + word_vectors["danger",] 
+search_synonyms(word_vectors, snow_danger)
+
+no_snow_danger <- word_vectors["danger",] - word_vectors["snow",] 
+search_synonyms(word_vectors, no_snow_danger)
+```
+
+## Grab GloVe Data 
+
+```{r}
+# download.file('https://nlp.stanford.edu/data/glove.6B.zip', destfile = 'data/glove.6B.zip')
+# unzip('data/glove.6B.zip')
+
+glove_data <- fread(here("data", "glove.6B.300d.txt"), header = FALSE)
+glove_df <- glove_data %>%
+  remove_rownames() %>%
+  column_to_rownames(var = 'V1')
+```
+
+## Recreate the Analyses on GloVe data
+
+## Find Synonyms in the glove data
+
+How are they different from the embeddings created from the climbing accident data? Why do you think they are different?
+
+```{r}
+glove_vectors <- as.matrix(glove_df)
+fall_glove <- search_synonyms(glove_vectors, glove_vectors["fall",])
+slip_glove <- search_synonyms(glove_vectors, glove_vectors["slip",])
+
+```
+
+```{r plot-synonyms}
+glove_syn_plot <- slip_glove %>%
+  mutate(selected = "slip") %>%
+  bind_rows(fall_glove %>%
+              mutate(selected = "fall")) %>%
+  group_by(selected) %>%
+  top_n(15, similarity) %>%
+  ungroup %>%
+  mutate(token = reorder(token, similarity)) %>%
+  ggplot(aes(token, similarity, fill = selected)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~selected, scales = "free") +
+  coord_flip() +
+  theme(strip.text=element_text(hjust=0, size=12)) +
+  scale_y_continuous(expand = c(0,0)) +
+  labs(x = NULL, 
+       title = "What word vectors are most similar to slip or fall in glove data?")
+
+```
+
+```{r, fig.height=6}
+climb_syn_plot / glove_syn_plot
+```
+
+
+```{r word-math}
+snow_danger <- word_vectors["snow",] + word_vectors["danger",] 
+search_synonyms(word_vectors, snow_danger)
+
+no_snow_danger <- word_vectors["danger",] - word_vectors["snow",] 
+search_synonyms(word_vectors, no_snow_danger)
+```
+
+
+
